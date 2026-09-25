@@ -104,6 +104,9 @@ const INPUT_STATE_INITIAL = 0;
 const INPUT_STATE_CHARGING = 1;
 const INPUT_STATE_REPEATING = 2;
 
+const LINE_CLEAR_DURATION = 600;
+const LINE_FLASH_INTERVAL = 100;
+
 function initCanvas(){
     const canvas = document.getElementById('game');
     canvas.width = CANVAS_WIDTH;
@@ -153,6 +156,12 @@ function getInitialState() {
         announcement: {
             message: null,
             background: null,
+            timeRemaining: 0,
+        },
+
+        clearingLines: {
+            active: false,
+            rows: [],
             timeRemaining: 0,
         },
     };
@@ -308,6 +317,18 @@ function attachToGrid(grid, currentPiece) {
     }
 }
 
+function getCompleteLines(grid) {
+    const rows = [];
+
+    for (let i = 0; i < grid.length; ++i) {
+        if (grid[i].every(cell => cell !== BLOCK_EMPTY)) {
+            rows.push(i);
+        }
+    }
+
+    return rows;
+}
+
 function clearCompleteLines(grid) {
     let clearedLines = 0;
 
@@ -359,10 +380,36 @@ function update(state, inputs, dt) {
     }
 }
 
+function spawnNextPiece(state) {
+    const newPiece = createCurrentPiece(state.nextShapeId);
+    const { shape, position } = newPiece;
+
+    if (canGridFitShape(state.grid, shape, position.x, position.y)) {
+        state.currentPiece = newPiece;
+        state.nextShapeId = getRandomShapeId();
+    } else {
+        state.isGameOver = true;
+        setAnnouncement(
+            state,
+            "Game over!",
+            COLOR_GAME_OVER_OVERLAY,
+            Infinity
+        );
+    }
+}
+
 function handleCurrentPieceLanding(state) {
     attachToGrid(state.grid, state.currentPiece);
     
-    const clearedLines = clearCompleteLines(state.grid);
+    const clearedLines = getCompleteLines(state.grid);
+
+    if (clearedLines.length > 0) {
+        state.clearingLines.active = true;
+        state.clearingLines.rows = clearedLines;
+        state.clearingLines.timeRemaining = LINE_CLEAR_DURATION;
+
+        return;
+    }
 
     state.clearedLines += clearedLines
 
@@ -373,30 +420,18 @@ function handleCurrentPieceLanding(state) {
 
         case 2:
             state.score += 3 * Math.floor(state.gravity.speed);
-            setAnnouncement(state, "Double!", null, 1000);
             break;
 
         case 3:
             state.score += 5 * Math.floor(state.gravity.speed);
-            setAnnouncement(state, "Triple!", null, 1000);
             break;
 
         case 4:
             state.score += 10 * Math.floor(state.gravity.speed);
-            setAnnouncement(state, "Tetris!", null, 1000);
             break;
     }
 
-    const newPiece = createCurrentPiece(state.nextShapeId);
-    const {shape, position} = newPiece;
-
-    if (canGridFitShape(state.grid, shape, position.x, position.y)) {
-        state.currentPiece = newPiece;
-        state.nextShapeId = getRandomShapeId();
-    } else {
-        state.isGameOver = true;
-        setAnnouncement(state, "Game over!", COLOR_GAME_OVER_OVERLAY, Infinity);
-    }
+    spawnNextPiece(state);
 }
 
 function moveCurrentPieceDown(state) {
@@ -419,6 +454,45 @@ function updateGravity(state, dt) {
     }
 }
 
+function updateClearingLines(state, dt) {
+    const clearing = state.clearingLines;
+
+    clearing.timeRemaining -= dt;
+
+    if (clearing.timeRemaining <= 0) {
+        const clearedLines = clearCompleteLines(state.grid);
+
+        state.clearedLines += clearedLines;
+
+        switch (clearedLines) {
+            case 1:
+                state.score += BASE_REWARD * Math.floor(state.gravity.speed);
+                break;
+
+            case 2:
+                state.score += 3 * Math.floor(state.gravity.speed);
+                setAnnouncement(state, "Double!", null, 1000);
+                break;
+
+            case 3:
+                state.score += 5 * Math.floor(state.gravity.speed);
+                setAnnouncement(state, "Triple!", null, 1000);
+                break;
+
+            case 4:
+                state.score += 10 * Math.floor(state.gravity.speed);
+                setAnnouncement(state, "Tetris!", null, 1000);
+                break;
+        }
+
+        clearing.active = false;
+        clearing.rows = [];
+        clearing.timeRemaining = 0;
+
+        spawnNextPiece(state);
+    }
+}
+
 function resetGameState(state) {
     Object.assign(state, getInitialState());
 }
@@ -430,10 +504,17 @@ function update(state, inputs, dt) {
         if (inputs.restart || inputs.hardDrop) {
             resetGameState(state);
         }
-    } else {
-        updateCurrentPiece(state, inputs, dt);
-        updateGravity(state, dt);
+
+        return;
     }
+
+    if (state.clearingLines.active) {
+        updateClearingLines(state, dt);
+        return;
+    }
+
+    updateCurrentPiece(state, inputs, dt);
+    updateGravity(state, dt);
 }
 
 function drawBlock(ctx, color, x, y) {
@@ -441,19 +522,33 @@ function drawBlock(ctx, color, x, y) {
     ctx.fillRect(x + 1, y + 1, BLOCK_SIZE - 1, BLOCK_SIZE - 1);
 }
 
-function drawShape(ctx, shape, colorId, x, y, isShadow) {
-    const color = SHAPE_COLORS[colorId];
+function transparentColor(color, opacity) {
+    const red = parseInt(color.slice(1, 3), 16);
+    const green = parseInt(color.slice(3, 5), 16);
+    const blue = parseInt(color.slice(5, 7), 16);
 
+    return `rgba(${red}, ${green}, ${blue}, ${opacity})`;
+}
+
+function drawShape(ctx, shape, shapeId, x, y, isShadow, clearingRows = [], isFlashing = false) {
     for (let i = 0; i < shape.length; ++i) {
-        for (let j = 0; j < shape[0].length; ++j) {
-            if (!shape[i][j]) continue;
+        for (let j = 0; j < shape[i].length; ++j) {
+            if (shape[i][j] !== 0) {
+                const row = y / BLOCK_SIZE + i;
 
-            drawBlock(
-                ctx,
-                isShadow ? `${color}20` : color,
-                x + j * BLOCK_SIZE,
-                y + i * BLOCK_SIZE
-            );
+                let color = isShadow ? transparentColor(SHAPE_COLORS[shapeId], 0.3) : SHAPE_COLORS[shapeId];
+
+                if (isFlashing && clearingRows.includes(row)) {
+                    color = COLOR_EMPTY_BLOCK;
+                }
+
+                drawBlock(
+                    ctx,
+                    color,
+                    x + j * BLOCK_SIZE,
+                    y + i * BLOCK_SIZE
+                );
+            }
         }
     }
 }
@@ -480,20 +575,24 @@ function getShadowPosition(grid, currentPiece) {
 
 function displayAnnouncement(ctx, announcement) {
     // fill in the background if required
-    if (background !== null) {
+    if (announcement.background !== null) {
         ctx.fillStyle = announcement.background;
         ctx.fillRect(0, 0, GRID_WIDTH, GRID_HEIGHT);
     }
 
     // make the text flash
-    else if (Math.floor(announcement.timeRemaining / 250) % 2 === 0) {
-        ctx.fillStyle = COLOR_FONT;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.font = 'bold 32px monospace';
+    if (announcement.message !== null) {
+    ctx.fillStyle = COLOR_FONT;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 32px monospace';
 
-        ctx.fillText(announcement.message, GRID_WIDTH / 2, GRID_HEIGHT / 2);
-    }
+    ctx.fillText(
+        announcement.message,
+        GRID_WIDTH / 2,
+        GRID_HEIGHT / 2
+    );
+}
 }
 
 function render(ctx, state) {
@@ -502,23 +601,34 @@ function render(ctx, state) {
 
     const { grid, currentPiece, nextShapeId } = state;
 
+    const isFlashing =
+        Math.floor(
+            state.clearingLines.timeRemaining / LINE_FLASH_INTERVAL
+        ) % 2 === 0;
+
     for (let i = 0; i < grid.length; ++i) {
+        const isClearingRow = state.clearingLines.rows.includes(i);
+
         for (let j = 0; j < grid[0].length; ++j) {
             const colorId = grid[i][j];
 
-            const color = colorId === BLOCK_EMPTY ? COLOR_EMPTY_BLOCK : SHAPE_COLORS[colorId];
+            let color =
+                colorId === BLOCK_EMPTY
+                    ? COLOR_EMPTY_BLOCK
+                    : SHAPE_COLORS[colorId];
 
-            drawBlock(ctx, color, j * BLOCK_SIZE, i * BLOCK_SIZE);
+            if (isClearingRow && isFlashing) {
+                color = COLOR_EMPTY_BLOCK;
+            }
+
+            drawBlock(
+                ctx,
+                color,
+                j * BLOCK_SIZE,
+                i * BLOCK_SIZE
+            );
         }
     }
-
-    // draw the shape being dropped
-    drawShape(ctx,
-                currentPiece.shape,
-                currentPiece.shapeId,
-                currentPiece.position.x * BLOCK_SIZE,
-                currentPiece.position.y * BLOCK_SIZE,
-                false);
 
     // get the position where the current piece will land
     const shadowPosition = getShadowPosition(grid, currentPiece);
@@ -530,6 +640,18 @@ function render(ctx, state) {
                 shadowPosition.x * BLOCK_SIZE,
                 shadowPosition.y * BLOCK_SIZE,
                 true);
+
+    // draw the shape being dropped
+    drawShape(
+        ctx,
+        currentPiece.shape,
+        currentPiece.shapeId,
+        currentPiece.position.x * BLOCK_SIZE,
+        currentPiece.position.y * BLOCK_SIZE,
+        false,
+        state.clearingLines.rows,
+        isFlashing
+    );
 
     // draw the shape that will come up next
     drawShape(ctx,
